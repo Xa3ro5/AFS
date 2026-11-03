@@ -53,12 +53,12 @@ local config = {stat="Strength", cycle=false, cycleSeconds=30, bestZone=true,
     moveMode="Game Teleport", tweenSpeed=100, timeout=12, interval=1.1,
     speed=60, jump=60, fov=80, routeRadius=1000, resumeRespawn=true,
     bosses={}, farmBosses=false, mob="Thug", weapon="Sword", behindDistance=3, behindHeight=1, specialRotateSeconds=10, bossWeapon="Sword", powerMode="All Unlocked", specialMode="Rotate All", castPowers=true, castSpecials=true, castBasic=true, autoTransform=true, castSpecialM1=true, mobStall=90, fruit="All Fruits", placeCategory="All Locations", dungeonDifficulty="Easy"}
-local flags = {IndexRewards=false,DailyRewards=false,AutoDungeon=false, AutoQuest=false, TargetMainQuest=false, QuestScan=false, BossFarm=false, KillAllPlayers=false, KillSelectedPlayer=false, FruitSnipe=false, AutoJoinBoss=false, MobFarm=false, Train=false, Rewards=false, Noclip=false, Speed=false, Jump=false,
+local flags = {AutoClass=false,IndexRewards=false,DailyRewards=false,AutoDungeon=false, AutoQuest=false, TargetMainQuest=false, QuestScan=false, BossFarm=false, KillAllPlayers=false, KillSelectedPlayer=false, FruitSnipe=false, AutoJoinBoss=false, MobFarm=false, Train=false, Rewards=false, Noclip=false, Speed=false, Jump=false,
     InfiniteJump=false, Fly=false, AntiAFK=false, Fullbright=false, FOV=false, ESP=false}
 local state = {alive=true, ready=false, generation=0, action="Idle", target="—",
     result="—", waiting="—", error="—", zones={}, places={}, requests={}, claimed={},
     confirmed=0, rejected=0, trainStat=nil, trainingSnapshot=nil, move=nil}
-local api = {Config=config, Flags=flags, Version="2026-10-25.1"}
+local api = {Config=config, Flags=flags, Version="2026-11-03.1"}
 env.AFS = api
 local connections, toggleControls, highlights = {}, {}, {}
 local window, uiRoot, zoneDropdown, placeDropdown, statusLabel, statsLabel, questLabel, mobDropdown, bossSection, mobLabel, placeLabel, fruitLabel, bossJoinLabel, fruitDropdown
@@ -3057,6 +3057,9 @@ api.AvailablePowers=availablePowers
 api.SpecialSlots=specialSlots
 
 function api.StopAll()
+    if api.ClassUpgrade then
+        api.ClassUpgrade.epoch+=1 api.ClassUpgrade.status="Idle" api.ClassUpgrade.nextAt=0
+    end
     dungeon.farm={status="Idle"}
     if Adapter.Troll then Adapter.Troll.status="Idle" end
     config.farmBosses=false state.bossPriority=false state.bossProbe=nil state.nextBossProbe=nil
@@ -3091,6 +3094,11 @@ function api.Set(name,value)
         state.waiting="Auto Dungeon requires an existing dungeon" return
     end
     local changed=flags[name]~=value
+    if name=="AutoClass" and changed then
+        api.ClassUpgrade.epoch+=1
+        api.ClassUpgrade.nextAt=0
+        api.ClassUpgrade.status=value and "Checking class requirements..." or "Idle"
+    end
     local exclusive={AutoDungeon=true,AutoQuest=true,QuestScan=true,Train=true,MobFarm=true,BossFarm=true,KillAllPlayers=true,KillSelectedPlayer=true,Fly=true}
     if exclusive[name] or (name=="TargetMainQuest" and changed and (flags.AutoQuest or flags.QuestScan)) then
         state.generation+=1 api.CancelMove() releaseTraining() mobs.ReleaseTarget(mobs.target) releaseCast()
@@ -4568,6 +4576,41 @@ task.spawn(function()
     end
 end)
 
+-- The native Classes page calls this RPC without arguments. The server checks
+-- Yen and every stat requirement; do not infer eligibility from stale UI text.
+do
+local upgrade={epoch=0,nextAt=0,busy=false,status="Idle",confirmed=0}
+api.ClassUpgrade=upgrade
+function upgrade.Step()
+    if not state.alive or not state.ready or not flags.AutoClass or upgrade.busy
+        or os.clock()<upgrade.nextAt then return end
+    local token,epoch=state.generation,upgrade.epoch
+    upgrade.nextAt=os.clock()+5
+    upgrade.busy=true
+    upgrade.status="Waiting for server class check..."
+    local ok,accepted,message=request("requestClassUnlock",token)
+    upgrade.busy=false
+    if not valid(token) or not flags.AutoClass or epoch~=upgrade.epoch then return end
+    if ok and accepted==true then
+        upgrade.confirmed+=1
+        upgrade.status="Class upgrade confirmed by server"
+        state.result=upgrade.status
+    elseif ok and message=="Already at the highest class" then
+        api.Set("AutoClass",false)
+        upgrade.status="Maximum class reached"
+    else
+        upgrade.status=tostring(message or accepted or "Class upgrade not available yet")
+        if not ok then upgrade.nextAt=os.clock()+15 end
+    end
+end
+task.spawn(function()
+    while state.alive do
+        upgrade.Step()
+        task.wait(0.5)
+    end
+end)
+end
+
 do
 local function buildUI()
 -- Preserve existing boss checklist choices when the translated UI gets its new config.
@@ -4693,6 +4736,10 @@ trainSettings:Toggle("Auto Best Training Area",function(on)
 end,true)
 trainSettings:Label("Speed / Agility alternates both areas.\nInside training areas: stand still, no movement or jumping.")
 state.trainLabel=trainSettings:Label("Idle")
+local classSection=training:Section("Class Upgrade")
+toggle(classSection,"Auto Class Upgrade","AutoClass")
+classSection:Label("Unlocks the next class when Yen and stat requirements are met.\nSpends the required Yen. Checks every 5 seconds.")
+api.ClassUpgrade.label=classSection:Label("Idle")
 local fruitTab=window:Folder("Fruit Sniper")
 local fruitSection=fruitTab:Section("Snipe Fruit")
 fruitDropdown=fruitSection:Dropdown("Fruit",fruitOptions,function(id)
@@ -4827,6 +4874,7 @@ function api.Diagnose()
     return {version=api.Version,alive=state.alive,flags=table.clone(flags),action=state.action,target=state.target,
         result=state.result,waiting=state.waiting,error=state.error,zones=#state.zones,places=#state.places,
         rewards={status=api.Rewards.status,indexConfirmed=api.Rewards.confirmed},
+        classUpgrade={status=api.ClassUpgrade.status,confirmed=api.ClassUpgrade.confirmed,busy=api.ClassUpgrade.busy},
         stats=stats,source=source,pending=pending,accepted=state.confirmed,rejected=state.rejected,
         moving=state.move~=nil,claimed=state.claimed,generation=state.generation,bossPriority=state.bossPriority==true,
         mob=config.mob,mobTarget=mobs.target and mobs.target.id,mobHP=mobs.target and mobs.target.hp,
@@ -4992,6 +5040,7 @@ task.spawn(function()
             end
             local d=api.Diagnose()
             if api.Rewards.label then api.Rewards.label:SetText(api.Rewards.status.."\nIndex claims confirmed: "..api.Rewards.confirmed) end
+            if api.ClassUpgrade.label then api.ClassUpgrade.label:SetText(api.ClassUpgrade.status.."\nUpgrades confirmed: "..api.ClassUpgrade.confirmed) end
             if dungeon.label then dungeon.label:SetText(dungeon.farm.status.."\nPhase: "..tostring(d.autoDungeon.phase or "Unknown")) end
             state.trainLabel:SetText(flags.Train and (d.action.."\n"..d.target.."\n"..d.waiting.."\nGear: "..Adapter.TrainingGear.status) or "Idle")
             statusLabel:SetText("Action: "..d.action.."\nTarget: "..d.target.."\nResult: "..d.result.."\nWaiting: "..d.waiting.."\nError: "..d.error.."\nRPC accepted / rejected: "..d.accepted.." / "..d.rejected)
