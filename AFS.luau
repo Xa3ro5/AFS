@@ -58,7 +58,7 @@ local flags = {AutoClass=false,IndexRewards=false,DailyRewards=false,AutoDungeon
 local state = {alive=true, ready=false, generation=0, action="Idle", target="—",
     result="—", waiting="—", error="—", zones={}, places={}, requests={}, claimed={},
     confirmed=0, rejected=0, trainStat=nil, trainingSnapshot=nil, move=nil}
-local api = {Config=config, Flags=flags, Version="2026-11-03.1"}
+local api = {Config=config, Flags=flags, Version="2026-11-05.1"}
 env.AFS = api
 local connections, toggleControls, highlights = {}, {}, {}
 local window, uiRoot, zoneDropdown, placeDropdown, statusLabel, statsLabel, questLabel, mobDropdown, bossSection, mobLabel, placeLabel, fruitLabel, bossJoinLabel, fruitDropdown
@@ -4576,18 +4576,77 @@ task.spawn(function()
     end
 end)
 
--- The native Classes page calls this RPC without arguments. The server checks
--- Yen and every stat requirement; do not infer eligibility from stale UI text.
+-- Never use the unlock RPC to probe affordability: a rejection may offer Robux.
+-- Prefer exact game data; executor fallback requires the live native Classes page.
 do
 local upgrade={epoch=0,nextAt=0,busy=false,status="Idle",confirmed=0}
+local classes=module("Dictionaries.Classes")
 api.ClassUpgrade=upgrade
+local function amount(value)
+    return type(value)=="number" and value==value and value>=0 and value<math.huge
+end
+function upgrade.Eligible()
+    local current=dataAt("Class")
+    local yen=currencyAmount("Yen")
+    if not amount(yen) then return false,"Waiting for Yen balance" end
+    if classes and type(classes.getNextClass)=="function" and amount(current) and current%1==0 then
+        local ok,nextClass=pcall(classes.getNextClass,current)
+        if not ok then return false,"Waiting for class requirements" end
+        if nextClass==nil then
+            local known,entry=false,nil
+            if type(classes.getByOrder)=="function" then known,entry=pcall(classes.getByOrder,current+1) end
+            if known and type(entry)=="table" then return false,"Maximum class reached",true end
+            return false,"Waiting for current class data"
+        end
+        if type(nextClass)~="table" or not amount(nextClass.cost) or type(nextClass.requirements)~="table" then
+            return false,"Waiting for class requirements"
+        end
+        if yen<nextClass.cost then return false,"Waiting for Yen for the next class" end
+        local stats=Adapter.stats()
+        for name,required in pairs(nextClass.requirements) do
+            if not amount(required) or not amount(stats[name]) or stats[name]<required then
+                return false,"Waiting for class stat requirements: "..tostring(name)
+            end
+        end
+        return true
+    end
+    -- Closed pages retain stale labels and button colours. Only onOpen installs
+    -- the native Class / Currency.Yen / Stats subscriptions that keep this live.
+    local page=path(player.PlayerGui,"Main.Pages.Classes")
+    local visible=page
+    while visible and visible~=player.PlayerGui do
+        if (visible:IsA("GuiObject") and not visible.Visible)
+            or (visible:IsA("ScreenGui") and not visible.Enabled) then
+            return false,"Open the game's Classes menu to check requirements"
+        end
+        visible=visible.Parent
+    end
+    if not page or visible~=player.PlayerGui then return false,"Waiting for class requirements" end
+    local base=path(page,"Page.Main.Bottom.InfoDisplay")
+    local progress=path(base,"Frame.QuestBar.QuestBarProgressAmount")
+    local green=path(base,"UnlockButton.Green")
+    local priceText=progress and progress.Text:match("/%s*(.-)%s*$")
+    local _,cost=parseDisplay(priceText or "")
+    if not amount(cost) then return false,"Waiting for class price" end
+    if yen<cost then return false,"Waiting for Yen for the next class" end
+    -- Green is set only by the native canUnlockClass (exact Yen AND all stats).
+    -- The displayed price alone is rounded and cannot authorize a purchase.
+    if not green or not green.Enabled then return false,"Waiting for native class requirements" end
+    return true
+end
 function upgrade.Step()
     if not state.alive or not state.ready or not flags.AutoClass or upgrade.busy
         or os.clock()<upgrade.nextAt then return end
     local token,epoch=state.generation,upgrade.epoch
     upgrade.nextAt=os.clock()+5
+    local eligible,reason,maximum=upgrade.Eligible()
+    if not eligible then
+        if maximum then api.Set("AutoClass",false) end
+        upgrade.status=reason
+        return
+    end
     upgrade.busy=true
-    upgrade.status="Waiting for server class check..."
+    upgrade.status="Requesting eligible class upgrade..."
     local ok,accepted,message=request("requestClassUnlock",token)
     upgrade.busy=false
     if not valid(token) or not flags.AutoClass or epoch~=upgrade.epoch then return end
@@ -4738,7 +4797,7 @@ trainSettings:Label("Speed / Agility alternates both areas.\nInside training are
 state.trainLabel=trainSettings:Label("Idle")
 local classSection=training:Section("Class Upgrade")
 toggle(classSection,"Auto Class Upgrade","AutoClass")
-classSection:Label("Unlocks the next class when Yen and stat requirements are met.\nSpends the required Yen. Checks every 5 seconds.")
+classSection:Label("Checks Yen and stats before requesting an upgrade. Checks every 5 seconds.\nIf game data is unavailable, keep the game's Classes menu open for verification.")
 api.ClassUpgrade.label=classSection:Label("Idle")
 local fruitTab=window:Folder("Fruit Sniper")
 local fruitSection=fruitTab:Section("Snipe Fruit")
